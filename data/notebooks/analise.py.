@@ -1,0 +1,333 @@
+CÓDIGOS EM PYTHON USADOS:
+
+Código para extração de dados do youtube:
+from googleapiclient.discovery import build
+from datetime import datetime, timezone
+import pandas as pd
+
+# PARAMETROS
+
+API_KEY = "CHAVE_API"
+CHANNEL_ID = "ID_CANAL"
+SPLIT_DEFINITIONS = {
+    "1º SPLIT": {
+        "Pré":   (datetime(2025, 1, 18, tzinfo=timezone.utc), datetime(2025, 1, 24, tzinfo=timezone.utc)),
+        "Split": (datetime(2025, 1, 25, tzinfo=timezone.utc), datetime(2025, 2, 23, tzinfo=timezone.utc)),
+        "Pós":   (datetime(2025, 2, 24, tzinfo=timezone.utc), datetime(2025, 3, 2, tzinfo=timezone.utc)),
+    },
+    "2º SPLIT": {
+        "Pré":   (datetime(2025, 3, 29, tzinfo=timezone.utc), datetime(2025, 4, 4, tzinfo=timezone.utc)),
+        "Split": (datetime(2025, 4, 5, tzinfo=timezone.utc), datetime(2025, 5, 18, tzinfo=timezone.utc)),
+        "Pós":   (datetime(2025, 5, 19, tzinfo=timezone.utc), datetime(2025, 5, 25, tzinfo=timezone.utc)),
+    },
+    "3º SPLIT": {
+        "Pré":   (datetime(2025, 7, 19, tzinfo=timezone.utc), datetime(2025, 7, 25, tzinfo=timezone.utc)),
+        "Split": (datetime(2025, 7, 26, tzinfo=timezone.utc), datetime(2025, 9, 7, tzinfo=timezone.utc)),
+        "Pós":   (datetime(2025, 9, 8, tzinfo=timezone.utc), datetime(2025, 9, 14, tzinfo=timezone.utc)),
+    }
+}
+
+#CONFIGURACOES
+
+def get_youtube_service():
+    return build("youtube", "v3", developerKey=API_KEY)
+
+def get_channel_details(youtube, channel_id):
+    request = youtube.channels().list(
+        part="snippet,topicDetails,contentDetails",
+        id=channel_id
+    )
+    response = request.execute()
+
+    if not response["items"]:
+        raise ValueError("Canal não encontrado.")
+
+    item = response["items"][0]
+
+    channel_name = item["snippet"]["title"]
+    topics = item.get("topicDetails", {}).get("topicCategories", [])
+    topics = [t.split("/")[-1].replace("_", " ") for t in topics]
+    uploads_id = item["contentDetails"]["relatedPlaylists"]["uploads"]
+
+    return channel_name, topics, uploads_id
+
+def get_all_videos(youtube, playlist_id):
+    videos = []
+    next_page_token = None
+
+    while True:
+        pl_request = youtube.playlistItems().list(
+            part="contentDetails",
+            playlistId=playlist_id,
+            maxResults=50,
+            pageToken=next_page_token
+        )
+        pl_response = pl_request.execute()
+
+        video_ids = [item["contentDetails"]["videoId"] for item in pl_response["items"]]
+
+        if video_ids:
+            vid_request = youtube.videos().list(
+                part="snippet,statistics",
+                id=",".join(video_ids)
+            )
+            vid_response = vid_request.execute()
+
+            for item in vid_response["items"]:
+                pub_date = datetime.fromisoformat(
+                    item["snippet"]["publishedAt"].replace("Z", "+00:00")
+                )
+
+                videos.append({
+                    "video_id": item["id"],
+                    "title": item["snippet"]["title"],
+                    "published_at": pub_date,
+                    "views": int(item["statistics"].get("viewCount", 0)),
+                    "url": f"https://www.youtube.com/watch?v={item['id']}"
+                })
+
+        next_page_token = pl_response.get("nextPageToken")
+        if not next_page_token:
+            break
+
+    return videos
+
+def get_global_date_range(split_definitions):
+    start_dates = []
+    end_dates = []
+
+    for split in split_definitions.values():
+        for start, end in split.values():
+            start_dates.append(start)
+            end_dates.append(end.replace(hour=23, minute=59, second=59))
+
+    return min(start_dates), max(end_dates)
+
+def filter_videos_by_date(videos, start_date, end_date):
+    return [
+        v for v in videos
+        if start_date <= v["published_at"] <= end_date
+    ]
+
+def analyze_splits(videos):
+    rows = []
+
+    for split, periods in SPLIT_DEFINITIONS.items():
+        for fase, (start, end) in periods.items():
+            end = end.replace(hour=23, minute=59, second=59)
+
+            filtered = [
+                v for v in videos
+                if start <= v["published_at"] <= end
+            ]
+
+            qtd = len(filtered)
+            media = sum(v["views"] for v in filtered) / qtd if qtd > 0 else 0
+
+            rows.append({
+                "Split": split,
+                "Fase": fase,
+                "Qtd_Videos": qtd,
+                "Media_Views": round(media, 2)
+            })
+
+    return pd.DataFrame(rows)
+
+# MAIN
+
+def main():
+    try:
+        youtube = get_youtube_service()
+
+        # Dados do canal
+        name, topics, uploads_id = get_channel_details(youtube, CHANNEL_ID)
+
+        print(f"\nCANAL: {name}")
+        print(f"TÓPICOS: {', '.join(topics)}")
+
+        # Coleta de TODOS os vídeos
+        all_videos = get_all_videos(youtube, uploads_id)
+
+        if not all_videos:
+            print("Nenhum vídeo encontrado.")
+            return
+
+        # Definir intervalo oficial dos Splits
+        global_start, global_end = get_global_date_range(SPLIT_DEFINITIONS)
+
+        # Filtrar vídeos dentro do intervalo
+        videos_filtrados = filter_videos_by_date(
+            all_videos,
+            global_start,
+            global_end
+        )
+
+        if not videos_filtrados:
+            print(" Nenhum vídeo dentro do intervalo dos Splits.")
+            return
+
+        # TABELA DE VÍDEOS (BASE ANALÍTICA)
+        df_videos = pd.DataFrame(videos_filtrados)
+        df_videos.to_csv(
+            "TIME_splits_2025.csv",
+            index=False,
+            encoding="utf-8-sig"
+        )
+
+        # Vídeo mais assistido (somente do recorte)
+        best_video = df_videos.loc[df_videos["views"].idxmax()]
+
+        print(" VÍDEO MAIS ASSISTIDO NO PERÍODO DOS SPLITS")
+        print(f"Título: {best_video['title']}")
+        print(f"Views: {best_video['views']:,}")
+        print(f"Link: {best_video['url']}")
+
+        # Métricas por Split
+        df_splits = analyze_splits(videos_filtrados)
+        df_splits.to_csv(
+            "TIME_metricas_por_split_2025.csv",
+            index=False,
+            encoding="utf-8-sig"
+        )
+
+        print("CSVs GERADOS COM SUCESSO")
+
+    except Exception as e:
+        print(f"Erro: {e}")
+
+if __name__ == "__main__":
+    main()
+
+CÓDIGO PARA CRIACAO DO GRAFICO DE BARRAS ENTRE OS SPLITS DA RED: 
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 1. Adicionando uma coluna para identificar cada time antes de juntar
+red['Org'] = 'Red Canids'
+pain['Org'] = 'Pain Gaming'
+keyd['Org'] = 'Vivo Keyd Stars'
+
+# 2. Juntando os três DataFrames em um só
+df_completo = pd.concat([red, pain, keyd])
+
+# 3. Filtrando apenas os períodos que você deseja
+periodos_desejados = ['1º SPLIT - Pré','1º SPLIT - Split', '1º SPLIT - Pós']
+df_filtrado = df_completo[df_completo['PERIODO'].isin(periodos_desejados)]
+
+# 4. Configurando o visual do gráfico
+plt.figure(figsize=(10, 6))
+sns.set_theme(style="whitegrid")
+
+# 5. Criando o gráfico de barras (Somando as views automaticamente com o estimator=sum)
+grafico = sns.barplot(
+    data=df_filtrado,
+    x='PERIODO',
+    y='views',
+    hue='Org',
+    estimator=sum,
+    errorbar=None,
+    palette={'Red Canids': 'red', 'Pain Gaming': 'black', 'Vivo Keyd Stars': 'purple'}
+)
+
+# 6. Ajustando títulos e legendas
+plt.title('Soma de Visualizações: Split vs Pós-Split (2025)', fontsize=14)
+plt.xlabel('Período Competitivo', fontsize=12)
+plt.ylabel('Total de Visualizações', fontsize=12)
+plt.legend(title='Organização')
+
+plt.show()
+
+
+
+CÓDIGO RED AJUDANTE
+*PIP NECESSÁRIOS
+!pip install llama-index-experimental llama-index-llms-groq gradio -q
+!pip install gradio fpdf plotly pandas –q
+
+import pandas as pd
+import gradio as gr
+from google.colab import userdata
+from llama_index.llms.groq import Groq
+from llama_index.core import Settings
+from llama_index.experimental.query_engine.pandas import PandasQueryEngine
+from fpdf import FPDF
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# --- 1. CARREGAR DADOS ---
+df = pd.read_csv('RED_FINAL.csv', encoding='latin-1', sep=None, engine='python')
+
+# --- 2. CONFIGURAR ROBÔ ---
+key = userdata.get('GROQ_API')
+Settings.llm = Groq(model="llama-3.3-70b-versatile", api_key=key)
+query_engine = PandasQueryEngine(df=df, verbose=True)
+
+# --- 3. LOGICA DE MEMÓRIA ---
+historico_conversa = []
+
+def realizar_analise(pergunta):
+    resposta = str(query_engine.query(f"{pergunta}. Responda em Português BR."))
+    historico_conversa.append({"pergunta": pergunta, "resposta": resposta})
+    return resposta
+
+def criar_relatorio_pdf():
+    if not historico_conversa: return None
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(200, 10, txt="Relatório Acumulado", ln=True, align='C')
+    pdf.ln(10)
+    for i, item in enumerate(historico_conversa, 1):
+        pdf.set_font("Arial", 'B', 12)
+        pdf.multi_cell(0, 10, txt=f"PERGUNTA ({i}): {item['pergunta']}".encode('latin-1', 'replace').decode('latin-1'))
+        pdf.set_font("Arial", size=12)
+        pdf.multi_cell(0, 10, txt=f"RESPOSTA ({i}): {item['resposta']}".encode('latin-1', 'replace').decode('latin-1'))
+        pdf.ln(5)
+    nome = "relatorio_dinamico.pdf"
+    pdf.output(nome)
+    return nome
+
+# --- NOVIDADE: FUNÇÃO QUE GERA QUALQUER GRÁFICO ---
+def gerar_grafico_ia(pergunta_usuario):
+    # Pedimos para a IA criar o código de visualização baseado na pergunta
+    prompt_grafico = f"Baseado no dataframe 'df', gere APENAS o código Python usando Seaborn ou Matplotlib para: {pergunta_usuario}. Não use plt.show(), apenas crie a figura 'fig'."
+
+    # O query_engine já sabe transformar texto em código pandas/plot!
+    instrucao = query_engine.query(f"Gere o código para um gráfico de: {pergunta_usuario}. Use a biblioteca Seaborn.")
+
+    # Aqui o Python executa o que a IA sugeriu (mágica!)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    try:
+        # A IA decide o que desenhar aqui dentro
+        exec(instrucao.metadata['pandas_instruction_str'])
+        plt.tight_layout()
+        return plt.gcf()
+    except:
+        # Caso a pergunta não seja de gráfico, ele faz um padrão para não dar erro
+        sns.barplot(data=df.nlargest(5, 'views'), x='views', y='title')
+        return plt.gcf()
+
+# --- 4. INTERFACE ATUALIZADA ---
+with gr.Blocks(theme=gr.themes.Soft()) as app:
+    gr.Markdown("# 🐺RED AJUDANTE")
+
+    with gr.Row():
+        with gr.Column():
+            txt_input = gr.Textbox(label="O que você quer analisar ou desenhar?", placeholder="Ex: Gráfico de pizza por tipo de conteúdo")
+            with gr.Row():
+                btn_txt = gr.Button("Analisar 🔍", variant="primary")
+                btn_plot = gr.Button("Gerar Gráfico da Pergunta", variant="secondary")
+
+            res_txt = gr.Textbox(label="Resposta da IA")
+            btn_pdf = gr.Button("Gerar PDF do Histórico 📄")
+            res_pdf = gr.File(label="Download PDF")
+
+        with gr.Column():
+            res_plot = gr.Plot(label="Visualização Dinâmica")
+
+    btn_txt.click(fn=realizar_analise, inputs=txt_input, outputs=res_txt)
+    btn_plot.click(fn=gerar_grafico_ia, inputs=txt_input, outputs=res_plot)
+    btn_pdf.click(fn=criar_relatorio_pdf, outputs=res_pdf)
+
+app.launch(share=True)
